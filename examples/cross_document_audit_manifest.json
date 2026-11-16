@@ -1,0 +1,51 @@
+{
+  "mission": {
+    "id": "jev-project-document-review",
+    "description": "Deterministic presence checks for the JEV project documents"
+  },
+  "documents": [
+    {
+      "id": "mrd",
+      "role": "Market requirements",
+      "path": "../data/documents/BM.01.01.MRD.NV_2023.docx",
+      "type": "docx"
+    },
+    {
+      "id": "prd",
+      "role": "Product requirements",
+      "path": "../data/documents/BM.01.02.PRD.NV_2023.docx",
+      "type": "docx"
+    },
+    {
+      "id": "ttr",
+      "role": "Technical proposal",
+      "path": "../data/documents/BM.01.03.TTR.NV_2023.docx",
+      "type": "docx"
+    },
+    {
+      "id": "budget",
+      "role": "Project budget",
+      "path": "../data/documents/BM.01_Dự toán.xlsx",
+      "type": "xlsx"
+    }
+  ],
+  "checks": [
+    {
+      "id": "duration-18-months",
+      "label": "18-month duration is mentioned",
+      "patterns": ["\\b18\\s*tháng\\b", "\\b18\\s*months?\\b"],
+      "documents": ["mrd", "prd", "ttr"]
+    },
+    {
+      "id": "frequency-n78",
+      "label": "n78 band is mentioned",
+      "patterns": ["\\bn78\\b"],
+      "documents": ["mrd", "prd"]
+    }
+  ],
+  "reconciliation": {
+    "document_id": "budget",
+    "sheet": "Tong hop",
+    "cells": ["F29", "H29", "D32"]
+  }
+}
