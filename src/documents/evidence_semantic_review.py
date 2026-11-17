@@ -17,6 +17,18 @@ from src.documents.cross_document_audit import (
     read_xlsx,
 )
 from src.documents.semantic_review import meaningful_tokens
+from src.documents.semantic_contradiction_detector import classify_fact_pair
+from src.documents.semantic_evidence_validator import (
+    attach_fact_trace,
+    resolve_evidence_refs,
+    validate_comparison_basis,
+)
+from src.documents.semantic_fact_extractor import extract_fact_candidates
+from src.documents.semantic_fact_matcher import compare_fact_sets, compare_facts
+from src.documents.semantic_fact_normalizer import (
+    normalize_candidates,
+    normalize_numeric_value,
+)
 
 
 BACKEND = "llama.cpp HTTP API"
@@ -26,7 +38,7 @@ MAX_BLOCK_CHARS = 1800
 MAX_OUTPUT_TOKENS = 1400
 PROMPT_VERSION = "evidence-review-v3"
 RESPONSE_SCHEMA_VERSION = 3
-VALIDATOR_VERSION = "semantic-classification-v3"
+VALIDATOR_VERSION = "semantic-classification-v4"
 
 FINDING_TYPES = {
     "direct_contradiction",
@@ -373,15 +385,6 @@ def _document_evidence(
     return evidence
 
 
-_QUANTITY_PATTERN = re.compile(
-    r"(?P<value>\d+(?:[.,]\d+)?)\s*[- ]?\s*"
-    r"(?P<unit>months?|tháng|years?|năm|seconds?|secs?|minutes?|mins?|"
-    r"hours?|hrs?|days?|weeks?|%|GHz|MHz|kHz|Hz|Gbps|Mbps|kbps|bps|"
-    r"km|cm|mm|meters?|metres?|mét|milliwatts?|kilowatts?|watts?|"
-    r"millivolts?|kilovolts?|volts?|milliamps?|amps?|°C|"
-    r"USD|VND|VNĐ|đồng|m|s|min|h|d|w|kW|W|mV|kV|V|mA|A)(?![\w])",
-    flags=re.IGNORECASE,
-)
 _SEMANTIC_GROUPS = {
     "project": (
         "project", "task", "mission", "nhiệm vụ", "dự án", "prototype",
@@ -417,88 +420,8 @@ _SEMANTIC_GROUPS = {
 }
 
 
-_UNIT_DEFINITIONS: dict[str, tuple[str, str, float]] = {
-    "hz": ("frequency", "Hz", 1.0),
-    "khz": ("frequency", "Hz", 1_000.0),
-    "mhz": ("frequency", "Hz", 1_000_000.0),
-    "ghz": ("frequency", "Hz", 1_000_000_000.0),
-    "mm": ("length", "m", 0.001),
-    "cm": ("length", "m", 0.01),
-    "m": ("length", "m", 1.0),
-    "meter": ("length", "m", 1.0),
-    "meters": ("length", "m", 1.0),
-    "metre": ("length", "m", 1.0),
-    "metres": ("length", "m", 1.0),
-    "mét": ("length", "m", 1.0),
-    "km": ("length", "m", 1_000.0),
-    "s": ("time", "s", 1.0),
-    "sec": ("time", "s", 1.0),
-    "secs": ("time", "s", 1.0),
-    "second": ("time", "s", 1.0),
-    "seconds": ("time", "s", 1.0),
-    "min": ("time", "s", 60.0),
-    "mins": ("time", "s", 60.0),
-    "minute": ("time", "s", 60.0),
-    "minutes": ("time", "s", 60.0),
-    "h": ("time", "s", 3_600.0),
-    "hr": ("time", "s", 3_600.0),
-    "hrs": ("time", "s", 3_600.0),
-    "hour": ("time", "s", 3_600.0),
-    "hours": ("time", "s", 3_600.0),
-    "d": ("time", "s", 86_400.0),
-    "day": ("time", "s", 86_400.0),
-    "days": ("time", "s", 86_400.0),
-    "week": ("time", "s", 604_800.0),
-    "weeks": ("time", "s", 604_800.0),
-    "month": ("time", "month", 1.0),
-    "months": ("time", "month", 1.0),
-    "tháng": ("time", "month", 1.0),
-    "year": ("time", "month", 12.0),
-    "years": ("time", "month", 12.0),
-    "năm": ("time", "month", 12.0),
-    "%": ("ratio", "%", 1.0),
-    "bps": ("data_rate", "bps", 1.0),
-    "kbps": ("data_rate", "bps", 1_000.0),
-    "mbps": ("data_rate", "bps", 1_000_000.0),
-    "gbps": ("data_rate", "bps", 1_000_000_000.0),
-    "w": ("power", "W", 1.0),
-    "watt": ("power", "W", 1.0),
-    "watts": ("power", "W", 1.0),
-    "kw": ("power", "W", 1_000.0),
-    "kilowatt": ("power", "W", 1_000.0),
-    "kilowatts": ("power", "W", 1_000.0),
-    "mw": ("power", "W", 0.001),
-    "milliwatt": ("power", "W", 0.001),
-    "milliwatts": ("power", "W", 0.001),
-    "v": ("voltage", "V", 1.0),
-    "volt": ("voltage", "V", 1.0),
-    "volts": ("voltage", "V", 1.0),
-    "kv": ("voltage", "V", 1_000.0),
-    "kilovolt": ("voltage", "V", 1_000.0),
-    "kilovolts": ("voltage", "V", 1_000.0),
-    "mv": ("voltage", "V", 0.001),
-    "millivolt": ("voltage", "V", 0.001),
-    "millivolts": ("voltage", "V", 0.001),
-    "a": ("current", "A", 1.0),
-    "amp": ("current", "A", 1.0),
-    "amps": ("current", "A", 1.0),
-    "ma": ("current", "A", 0.001),
-    "milliamp": ("current", "A", 0.001),
-    "milliamps": ("current", "A", 0.001),
-    "usd": ("currency:usd", "USD", 1.0),
-    "vnd": ("currency:vnd", "VND", 1.0),
-    "vnđ": ("currency:vnd", "VND", 1.0),
-    "đồng": ("currency:vnd", "VND", 1.0),
-    "°c": ("temperature", "°C", 1.0),
-}
-
-
 def _canonical_quantity(value: str, unit: str) -> tuple[str, float, str]:
-    definition = _UNIT_DEFINITIONS.get(unit.casefold())
-    if definition is None:
-        return "unsupported", float(value.replace(",", ".")), unit
-    dimension, canonical_unit, factor = definition
-    return dimension, float(value.replace(",", ".")) * factor, canonical_unit
+    return normalize_numeric_value(value, unit)
 
 
 def _quantity_context(text: str, start: int, end: int) -> str:
@@ -661,6 +584,13 @@ def _normalized_conditions(context: str) -> str | None:
         "laboratory": ("laboratory", "lab test", "phòng thử nghiệm"),
         "outdoor": ("outdoor", "ngoài trời", "field test"),
         "indoor": ("indoor", "trong nhà"),
+        "pilot_configuration": (
+            "pilot configuration", "pilot config", "pilot deployment",
+        ),
+        "production_configuration": (
+            "production configuration", "production config",
+            "production deployment",
+        ),
         "n78": ("n78",),
         "32t32r": ("32t32r",),
         "ideal_channel": ("ideal channel", "kênh lý tưởng"),
@@ -679,58 +609,80 @@ def _normalized_quantity_facts(
     evidence: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
-    for item in evidence:
-        text = str(item.get("evidence_text") or "")
-        for match in _QUANTITY_PATTERN.finditer(text):
-            canonical_dimension, value, canonical_unit = _canonical_quantity(
-                match.group("value"), match.group("unit")
-            )
-            if canonical_dimension == "unsupported":
-                continue
+    candidates = normalize_candidates(extract_fact_candidates(evidence))
+    for candidate in candidates:
+        text = candidate["evidence_text"]
+        start = candidate["start"]
+        end = candidate["end"]
+        canonical_dimension = candidate["dimension"]
+        value = candidate["normalized_value"]
+        canonical_unit = candidate["normalized_unit"]
+        location = candidate["source_location"]
+        if canonical_dimension == "unsupported":
+            dimension = "unsupported"
+            property_name, subject = None, None
+            scope = None
+            time_context = None
+            conditions = None
+            measurement_state = "unknown"
+        else:
             dimension = (
                 "duration" if canonical_dimension == "time"
                 else canonical_dimension
             )
-            context = _quantity_context(text, match.start(), match.end())
+            context = _quantity_context(text, start, end)
             property_name, subject = _normalized_property(context, dimension)
             scope = _normalized_scope(context, property_name)
             time_context = _normalized_time_context(
                 context, scope, property_name
             )
             conditions = _normalized_conditions(context)
-            location = item.get("location")
             measurement_state = _normalized_measurement_state(
                 context, property_name
             )
-            confidence = (
-                "high"
-                if subject and property_name and scope and location
-                else "medium"
-                if subject and property_name
-                else "low"
+        confidence = (
+            "high"
+            if subject and property_name and scope and location
+            else "medium"
+            if subject and property_name
+            else "low"
+        )
+        missing_context = [
+            field for field, value_present in (
+                ("subject", subject),
+                ("property", property_name),
+                ("scope", scope),
+                ("time_context", time_context),
+                ("condition", conditions),
             )
-            facts.append({
-                "subject": subject,
-                "entity": subject,
-                "property": property_name,
-                "attribute_type": dimension,
-                "value": value,
-                "unit": canonical_unit,
-                "dimension": dimension,
-                "measurement_state": measurement_state,
-                "scope": scope,
-                "time_context": time_context,
-                "condition": conditions,
-                "source_evidence_id": item.get("evidence_id"),
-                "source_document_id": item.get("document_id"),
-                "source_location": location,
-                "evidence_refs": (
-                    [item["evidence_id"]]
-                    if item.get("evidence_id") else []
-                ),
-                "extraction_confidence": confidence,
-                "raw_value": match.group(0),
-            })
+            if not value_present
+        ]
+        facts.append({
+            "fact_id": candidate["fact_id"],
+            "subject": subject,
+            "entity": subject,
+            "property": property_name,
+            "attribute_type": dimension,
+            "value": value,
+            "unit": canonical_unit,
+            "dimension": dimension,
+            "measurement_state": measurement_state,
+            "scope": scope,
+            "time_context": time_context,
+            "condition": conditions,
+            "source_evidence_id": candidate["source_evidence_id"],
+            "source_document_id": candidate["source_document_id"],
+            "source_location": location,
+            "evidence_refs": candidate["evidence_refs"],
+            "extraction_confidence": confidence,
+            "raw_value": candidate["raw_text"],
+            "raw_numeric_value": candidate["raw_value"],
+            "raw_unit": candidate["raw_unit"],
+            "raw_text": text[start:end],
+            "normalized_value": value,
+            "normalized_unit": canonical_unit,
+            "missing_context": missing_context,
+        })
     return facts
 
 
@@ -786,11 +738,12 @@ def _normalized_measurement_state(
 
 
 def _quantity_facts(text: str) -> list[dict[str, Any]]:
+    candidates = normalize_candidates(
+        extract_fact_candidates([{"evidence_text": text}])
+    )
     facts = []
-    for match in _QUANTITY_PATTERN.finditer(text):
-        dimension, value, unit = _canonical_quantity(
-            match.group("value"), match.group("unit")
-        )
+    for candidate in candidates:
+        dimension = candidate["dimension"]
         if dimension == "time":
             dimension = "duration"
         elif dimension == "ratio":
@@ -801,15 +754,17 @@ def _quantity_facts(text: str) -> list[dict[str, Any]]:
             dimension = "distance"
         elif dimension == "data_rate":
             dimension = "throughput"
+        start = candidate["start"]
+        end = candidate["end"]
         facts.append({
             "dimension": dimension,
-            "value": value,
-            "unit": unit,
-            "raw": match.group(0),
-            "start": match.start(),
-            "end": match.end(),
+            "value": candidate["normalized_value"],
+            "unit": candidate["normalized_unit"],
+            "raw": candidate["raw_text"],
+            "start": start,
+            "end": end,
             "context_groups": _quantity_context_groups(
-                text, match.start(), match.end(), dimension
+                text, start, end, dimension
             ),
         })
     return facts
@@ -871,15 +826,13 @@ def _query_targets(question: str) -> tuple[list[dict[str, Any]], set[str]]:
 def _excerpt_for_question(text: str, target_facts: list[dict[str, Any]]) -> str:
     if len(text) <= MAX_BLOCK_CHARS:
         return text
-    for match in _QUANTITY_PATTERN.finditer(text):
-        matched_facts = _quantity_facts(match.group(0))
+    for fact in _quantity_facts(text):
         if any(
             (fact["dimension"], fact["value"])
             == (target["dimension"], target["value"])
-            for fact in matched_facts
             for target in target_facts
         ):
-            start = max(0, match.start() - MAX_BLOCK_CHARS // 3)
+            start = max(0, fact["start"] - MAX_BLOCK_CHARS // 3)
             end = min(len(text), start + MAX_BLOCK_CHARS)
             return text[start:end]
     return text[:MAX_BLOCK_CHARS]
@@ -1135,43 +1088,7 @@ def _valid_comparison_basis(
     finding: dict[str, Any],
     cited_evidence: list[dict[str, str]],
 ) -> bool:
-    basis = finding.get("comparison_basis")
-    if not isinstance(basis, dict) or set(basis) != set(COMPARISON_BASIS_FIELDS):
-        return False
-    documents = {item["document_id"] for item in cited_evidence}
-    if len(documents) < 2:
-        return False
-    for field in COMPARISON_BASIS_FIELDS:
-        value = basis.get(field)
-        if not isinstance(value, str) or not value.strip():
-            return False
-        normalized_value = value.casefold()
-        if normalized_value in {"n/a", "na", "unknown", "not applicable"}:
-            return False
-        for document_id in documents:
-            document_text = " ".join(
-                item["evidence_text"].casefold()
-                for item in cited_evidence
-                if item["document_id"] == document_id
-            )
-            if normalized_value not in document_text:
-                return False
-    cited_text = " ".join(
-        item["evidence_text"].casefold() for item in cited_evidence
-    )
-    economic_claim = re.search(
-        r"\b(cost|costs|saving|savings|reduction|price|chi phí|giảm giá thành|"
-        r"giảm chi phí|tiết kiệm)\b",
-        finding["claim"],
-        flags=re.IGNORECASE,
-    )
-    unverified_economic_context = re.search(
-        r"\b(assumption|assumed|pending|unverified|giả định|chưa xác minh|"
-        r"chờ|báo giá|tco|bom)\b",
-        cited_text,
-        flags=re.IGNORECASE,
-    )
-    return not (economic_claim and unverified_economic_context)
+    return validate_comparison_basis(finding, cited_evidence)
 
 
 def _quantity_pair_rejection(
@@ -1180,28 +1097,57 @@ def _quantity_pair_rejection(
     *,
     require_complete_context: bool,
 ) -> str | None:
-    if not left.get("source_evidence_id") or not right.get("source_evidence_id"):
-        return "A normalized quantity is missing its source evidence ID."
-    if not left.get("source_document_id") or not right.get("source_document_id"):
-        return "A normalized quantity is missing its source document ID."
-    if left["source_document_id"] == right["source_document_id"]:
-        return "Comparable quantities must come from different documents."
-    if not left.get("source_location") or not right.get("source_location"):
-        return "A cited quantity is missing its source location."
-    if left.get("dimension") != right.get("dimension"):
-        return "The cited quantities have incompatible dimensions."
-    if not left.get("property") or left.get("property") != right.get("property"):
-        return "The evidence does not establish the same measured property."
-    if not left.get("subject") or left.get("subject") != right.get("subject"):
-        return "The evidence does not establish the same subject."
-    if left.get("unit") != right.get("unit"):
-        return "The units could not be normalized to the same canonical unit."
-    if not left.get("scope") or left.get("scope") != right.get("scope"):
+    decision, reason = compare_facts(left, right)
+    if decision == "not_comparable":
+        if left.get("dimension") != right.get("dimension"):
+            return "The cited quantities have incompatible dimensions."
+        if (
+            not left.get("property")
+            or not right.get("property")
+            or left.get("property") != right.get("property")
+        ):
+            return "The evidence does not establish the same measured property."
+        if left.get("subject") != right.get("subject"):
+            return "The evidence does not establish the same subject."
+        if "measurement states" in reason or "different scopes" in reason:
+            return "The evidence does not establish the same scope or measurement state."
+        if "time contexts" in reason:
+            return "The evidence refers to different or unaligned time contexts."
+        if "different conditions" in reason:
+            return "The evidence does not establish comparable conditions."
+        return reason
+    if decision == "insufficient_context":
+        if "provenance" in reason:
+            if left.get("source_document_id") == right.get("source_document_id"):
+                return "Comparable quantities must come from different documents."
+            return "A normalized quantity is missing its source evidence or document ID."
+        if "location" in reason:
+            return "A cited quantity is missing its source location."
+        if "unsupported unit" in reason:
+            return "No source-supported numeric facts have a supported unit."
+        if "property" in reason:
+            return "The evidence does not establish the same measured property."
+        if "subject" in reason:
+            return "The evidence does not establish the same subject."
+        if "units" in reason:
+            return "The units could not be normalized to the same canonical unit."
+        if "scope" in reason or "state" in reason:
+            return "The evidence does not establish the same scope or measurement state."
+        if "time context" in reason:
+            if require_complete_context:
+                return "The evidence lacks an explicit shared time context."
+            if left.get("time_context") != right.get("time_context"):
+                return "The evidence refers to different or unaligned time contexts."
+        if "conditions" in reason:
+            if left.get("condition") != right.get("condition"):
+                return "The evidence does not establish comparable conditions."
+        elif "operating condition" in reason:
+            if require_complete_context or left.get("property") not in {
+                "project_duration", "prototype_delivery_duration",
+            }:
+                return "Comparable test or operating conditions are not specified."
+    if not left.get("scope") or not right.get("scope"):
         return "The evidence does not establish the same scope or measurement state."
-    if left.get("time_context") != right.get("time_context"):
-        return "The evidence refers to different or unaligned time contexts."
-    if left.get("condition") != right.get("condition"):
-        return "The evidence does not establish comparable conditions."
     if (
         not require_complete_context
         and left.get("property") not in {
@@ -1210,9 +1156,7 @@ def _quantity_pair_rejection(
         and not left.get("condition")
     ):
         return "Comparable test or operating conditions are not specified."
-    if require_complete_context and (
-        not left.get("time_context") or not left.get("condition")
-    ):
+    if require_complete_context and (not left.get("time_context") or not left.get("condition")):
         return (
             "The evidence lacks an explicit shared time context or test "
             "condition required for contradiction."
@@ -1224,57 +1168,7 @@ def _semantic_fact_comparability(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> tuple[str, str]:
-    if (
-        not left.get("source_evidence_id")
-        or not right.get("source_evidence_id")
-        or not left.get("source_document_id")
-        or not right.get("source_document_id")
-        or left.get("source_document_id") == right.get("source_document_id")
-    ):
-        return "insufficient_context", "Evidence provenance does not identify two distinct source documents."
-    if not left.get("source_location") or not right.get("source_location"):
-        return "insufficient_context", "At least one evidence location is unavailable."
-    if left.get("dimension") == "unsupported" or right.get("dimension") == "unsupported":
-        return "insufficient_context", "At least one quantity has an unsupported unit or dimension."
-    if left.get("dimension") != right.get("dimension"):
-        return "not_comparable", "The quantities have different physical dimensions."
-    if not left.get("subject") or not right.get("subject"):
-        return "insufficient_context", "A shared subject cannot be established from the evidence."
-    if left["subject"] != right["subject"]:
-        return "not_comparable", "The quantities refer to different subjects."
-    if not left.get("property") or not right.get("property"):
-        return "insufficient_context", "A shared property cannot be established from the evidence."
-    if left["property"] != right["property"]:
-        return "not_comparable", "The quantities describe different properties."
-    left_state = left.get("measurement_state", "unknown")
-    right_state = right.get("measurement_state", "unknown")
-    if left_state == "unknown" or right_state == "unknown":
-        return "insufficient_context", "At least one measurement state is unknown."
-    if left_state != right_state:
-        return "not_comparable", "The evidence compares different measurement states."
-    left_scope = left.get("scope")
-    right_scope = right.get("scope")
-    if left_scope and right_scope and left_scope != right_scope:
-        return "not_comparable", "The quantities apply to different scopes."
-    left_time = left.get("time_context")
-    right_time = right.get("time_context")
-    if left_time and right_time and left_time != right_time:
-        return "not_comparable", "The quantities refer to different time contexts."
-    left_condition = left.get("condition")
-    right_condition = right.get("condition")
-    if left_condition and right_condition and left_condition != right_condition:
-        return "not_comparable", "The quantities apply under different conditions."
-    if left.get("unit") != right.get("unit"):
-        return "insufficient_context", "The units have not been normalized to the same canonical unit."
-    if not left_time or not right_time:
-        return "insufficient_context", "A shared time context is not explicit."
-    if bool(left_condition) != bool(right_condition):
-        return "insufficient_context", "Conditions are specified for only one quantity."
-    if left.get("value") == right.get("value"):
-        return "equivalent", "Subject, property, state, scope, time context, conditions, and normalized value align."
-    if not left_condition:
-        return "insufficient_context", "Different values lack a shared explicit operating condition."
-    return "comparable_but_different", "The same attribute differs under aligned state, scope, time, conditions, and units."
+    return compare_facts(left, right)
 
 
 def _semantic_comparability_decisions(
@@ -1287,39 +1181,7 @@ def _semantic_comparability_decisions(
             fact for fact in facts
             if fact.get("dimension") in target_dimensions
         ]
-    decisions: list[dict[str, Any]] = []
-    for index, left in enumerate(facts):
-        for right in facts[index + 1:]:
-            if left.get("source_document_id") == right.get("source_document_id"):
-                continue
-            decision, reason = _semantic_fact_comparability(left, right)
-            decisions.append({
-                "decision": decision,
-                "reason": reason,
-                "left": {
-                    "evidence_id": left.get("source_evidence_id"),
-                    "document_id": left.get("source_document_id"),
-                    "location": left.get("source_location"),
-                    "subject": left.get("subject"),
-                    "property": left.get("property"),
-                    "dimension": left.get("dimension"),
-                    "value": left.get("value"),
-                    "unit": left.get("unit"),
-                    "measurement_state": left.get("measurement_state"),
-                },
-                "right": {
-                    "evidence_id": right.get("source_evidence_id"),
-                    "document_id": right.get("source_document_id"),
-                    "location": right.get("source_location"),
-                    "subject": right.get("subject"),
-                    "property": right.get("property"),
-                    "dimension": right.get("dimension"),
-                    "value": right.get("value"),
-                    "unit": right.get("unit"),
-                    "measurement_state": right.get("measurement_state"),
-                },
-            })
-    return decisions
+    return compare_fact_sets(facts)
 
 
 def _target_dimensions(text: str) -> set[str]:
@@ -1377,6 +1239,7 @@ def _apply_classification_policy(
             if item["left"]["dimension"] in target_dimensions
             and item["right"]["dimension"] in target_dimensions
         ]
+        cited_target_decisions = list(target_decisions)
         target_decisions.extend(
             item for item in catalog_decisions
             if item not in target_decisions
@@ -1395,7 +1258,9 @@ def _apply_classification_policy(
             ]
         equivalent = [
             item for item in target_decisions
-            if item["decision"] == "equivalent"
+            if classify_fact_pair(
+                item["left"], item["right"], item["decision"]
+            )[0] == "consistent"
         ]
         cross_dimension = [
             item for item in target_decisions
@@ -1409,6 +1274,40 @@ def _apply_classification_policy(
             ),
             None,
         )
+
+        if raw.get("status") == "consistent" and not any(
+            item["decision"] == "equivalent"
+            for item in cited_target_decisions
+        ):
+            incompatible = next(
+                (
+                    item for item in cited_target_decisions
+                    if item["decision"] == "not_comparable"
+                ),
+                None,
+            )
+            if incompatible is not None:
+                accepted_match = next(
+                    (
+                        item for item in accepted
+                        if item.get("claim") == raw.get("claim", "").strip()
+                    ),
+                    None,
+                )
+                if accepted_match is not None:
+                    accepted.remove(accepted_match)
+                rejected.append({
+                    "finding_index": str(index),
+                    "classification": "not_comparable",
+                    "reason": (
+                        "A consistent finding requires comparable source facts; "
+                        + incompatible["reason"]
+                    ),
+                })
+                reasons.append(
+                    "not_comparable: cited source facts differ in a material comparison attribute."
+                )
+                continue
 
         if raw.get("status") == "contradiction_candidate" and cross_dimension:
             if existing_rejected is None:
@@ -1706,15 +1605,17 @@ def _validate_findings(
                 "reason": "Duplicate evidence references are not allowed.",
             })
             continue
-        unknown_refs = [ref for ref in refs if ref not in by_id]
-        if unknown_refs:
+        cited, reference_errors = resolve_evidence_refs(
+            refs,
+            evidence_catalog,
+        )
+        if reference_errors:
             rejected.append({
                 "finding_index": str(index),
                 "reason": "Finding cited evidence IDs not present in the input.",
             })
             continue
 
-        cited = [by_id[ref] for ref in refs]
         distinct_documents = {item["document_id"] for item in cited}
         if status == "missing_evidence":
             if cited:
@@ -1771,13 +1672,14 @@ def _validate_findings(
                 })
                 continue
             comparable, pair_rejections = _contradiction_pairs(cited)
-            conflicting = next(
-                (
-                    pair for pair in comparable
-                    if pair["left"]["value"] != pair["right"]["value"]
-                ),
-                None,
-            )
+            conflicting = next((
+                pair for pair in comparable
+                if classify_fact_pair(
+                    pair["left"],
+                    pair["right"],
+                    "comparable_but_different",
+                )[0] == "contradiction_candidate"
+            ), None)
             if conflicting is None:
                 matching_pairs = _comparable_numeric_pairs(cited)
                 if any(
@@ -2068,6 +1970,11 @@ def review_pair(
             _apply_classification_policy(
                 question, parsed, selected, accepted, rejected
             )
+        )
+        attach_fact_trace(
+            accepted,
+            normalized_facts,
+            comparability_decisions,
         )
         if accepted:
             outcome = "findings"

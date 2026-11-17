@@ -914,6 +914,8 @@ def test_case_a_equal_planned_delivery_is_reclassified_consistent(tmp_path):
         "mrd", "prd",
     }
     assert all(item["location"] for item in report["findings"][0]["evidence"])
+    assert len(report["findings"][0]["fact_refs"]) >= 2
+    assert report["findings"][0]["fact_pairs"][0]["comparability"] == "equivalent"
 
 
 def test_case_a_recovers_cross_document_support_when_model_cites_one_document():
@@ -1018,12 +1020,57 @@ def test_case_c_frequency_and_distance_are_not_comparable(tmp_path):
 
     assert report["final_classification"] == "not_comparable"
     assert report["findings"] == []
-    assert report["rejected_findings"][0]["classification"] == "not_comparable"
+    assert any(
+        finding.get("classification") == "not_comparable"
+        for finding in report["rejected_findings"]
+    )
     assert report["evidence_gaps"] == []
     assert any(
         item["decision"] == "not_comparable"
         and item["left"]["dimension"] != item["right"]["dimension"]
         for item in report["comparability_decisions"]
+    )
+
+
+def test_equal_cost_metrics_with_different_deployment_scope_are_not_consistent(
+    tmp_path,
+):
+    manifest = create_manifest(
+        tmp_path,
+        "The target cost reduction is 20% for the pilot configuration in 2025 under the baseline schedule.",
+        "The target cost reduction is 20% for the production configuration in 2025 under the baseline schedule.",
+    )
+    finding = model_finding(
+        status="consistent",
+        finding_type="unsupported_claim",
+        refs=["E001", "E002"],
+        comparison_basis={
+            "subject": "system cost",
+            "quantity": "cost reduction",
+            "unit": "%",
+            "timeframe": "2025",
+            "conditions": "the target cost reduction",
+        },
+    )
+    finding["claim"] = "The cost-reduction targets are consistent."
+
+    report = review_pair(
+        manifest,
+        "mrd",
+        "prd",
+        "Compare the 20% cost-reduction target across deployment configurations.",
+        MockClient(response([finding])),
+    )
+
+    assert report["final_classification"] == "not_comparable"
+    assert report["findings"] == []
+    assert any(
+        finding.get("classification") == "not_comparable"
+        for finding in report["rejected_findings"]
+    )
+    assert any(
+        "different conditions" in finding["reason"]
+        for finding in report["rejected_findings"]
     )
 
 
