@@ -7,8 +7,13 @@ from docx import Document
 from src.documents.evidence_semantic_review import (
     ChatCompletion,
     LocalQwenCompletionClient,
+    _apply_classification_policy,
+    _normalized_quantity_facts,
+    _semantic_fact_comparability,
+    _quantity_pairs,
     _select_evidence,
     _select_evidence_with_diagnostics,
+    _validate_findings,
     review_pair,
 )
 
@@ -585,7 +590,7 @@ def test_different_measurement_dimensions_cannot_be_a_contradiction(tmp_path):
     assert report["status"] == "completed"
     assert report["outcome"] == "findings_rejected"
     assert report["findings"] == []
-    assert "different values" in report["rejected_findings"][0]["reason"]
+    assert "dimension" in report["rejected_findings"][0]["reason"]
 
 
 def test_contradiction_requires_explicit_explanation_and_different_values(
@@ -604,7 +609,7 @@ def test_contradiction_requires_explicit_explanation_and_different_values(
     )
 
     assert report["outcome"] == "findings_rejected"
-    assert "did not explain" in report["rejected_findings"][0]["reason"]
+    assert "must name the source-supported values" in report["rejected_findings"][0]["reason"]
 
     equal_values = model_finding()
     equal_values["evidence_refs"] = ["E001", "E002"]
@@ -620,7 +625,9 @@ def test_contradiction_requires_explicit_explanation_and_different_values(
         MockClient(response([equal_values])),
     )
     assert equal_report["outcome"] == "findings_rejected"
-    assert "different values" in equal_report["rejected_findings"][0]["reason"]
+    assert "equal values cannot establish a contradiction" in (
+        equal_report["rejected_findings"][0]["reason"]
+    )
 
 
 def test_contradiction_rejects_different_subjects_with_same_dimension(tmp_path):
@@ -647,7 +654,657 @@ def test_contradiction_rejects_different_subjects_with_same_dimension(tmp_path):
     )
 
     assert report["outcome"] == "findings_rejected"
-    assert "shared local subject context" in report["rejected_findings"][0]["reason"]
+    assert "measured property" in report["rejected_findings"][0]["reason"]
+
+
+def _quantity_evidence(
+    document_id: str,
+    evidence_id: str,
+    text: str,
+    location: str | None = "paragraph 1",
+) -> dict[str, str | None]:
+    return {
+        "evidence_id": evidence_id,
+        "document_id": document_id,
+        "source_path": f"{document_id}.docx",
+        "location": location,
+        "evidence_text": text,
+    }
+
+
+def _validate_direct_finding(finding, evidence):
+    return _validate_findings(
+        {"findings": [finding], "limitations": []},
+        evidence,
+    )
+
+
+def _semantic_fact(
+    *,
+    evidence_id="E001",
+    document_id="mrd",
+    subject="project_prototype",
+    property_name="prototype_delivery_duration",
+    dimension="duration",
+    value=18.0,
+    unit="month",
+    state="planned",
+    scope="planned",
+    time_context="project_plan",
+    condition="baseline_scope",
+    location="paragraph 1",
+):
+    return {
+        "source_evidence_id": evidence_id,
+        "source_document_id": document_id,
+        "source_location": location,
+        "subject": subject,
+        "entity": subject,
+        "property": property_name,
+        "attribute_type": dimension,
+        "dimension": dimension,
+        "value": value,
+        "unit": unit,
+        "measurement_state": state,
+        "scope": scope,
+        "time_context": time_context,
+        "condition": condition,
+        "evidence_refs": [evidence_id],
+        "extraction_confidence": "high",
+    }
+
+
+def _compare_semantic_facts(left=None, right=None):
+    return _semantic_fact_comparability(
+        _semantic_fact() if left is None else left,
+        _semantic_fact(evidence_id="E002", document_id="prd")
+        if right is None else right,
+    )[0]
+
+
+def test_semantic_comparability_matrix_equivalent_facts():
+    assert _compare_semantic_facts() == "equivalent"
+
+
+def test_semantic_comparability_matrix_same_metric_different_values():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            value=12.0,
+        )
+    ) == "comparable_but_different"
+
+
+def test_semantic_comparability_matrix_same_unit_different_property():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            property_name="warranty_duration",
+        )
+    ) == "not_comparable"
+
+
+def test_semantic_comparability_matrix_different_dimensions():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            dimension="length",
+            property_name="transmission_distance",
+            unit="m",
+            value=100.0,
+        )
+    ) == "not_comparable"
+
+
+def test_semantic_comparability_matrix_different_subjects():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            subject="device",
+        )
+    ) == "not_comparable"
+
+
+@pytest.mark.parametrize(
+    ("left_state", "right_state", "left_scope", "right_scope"),
+    [
+        ("planned", "actual", "planned", "actual"),
+        ("estimate", "verified", "estimate", "measured_actual"),
+        ("target", "measured", "target", "measured_actual"),
+    ],
+)
+def test_semantic_comparability_rejects_different_measurement_states(
+    left_state, right_state, left_scope, right_scope
+):
+    assert _compare_semantic_facts(
+        _semantic_fact(state=left_state, scope=left_scope),
+        _semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            state=right_state,
+            scope=right_scope,
+        ),
+    ) == "not_comparable"
+
+
+def test_semantic_comparability_rejects_different_time_contexts():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            time_context="2026",
+        )
+    ) == "not_comparable"
+
+
+def test_semantic_comparability_rejects_incompatible_scope():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            scope="accepted_scope",
+        )
+    ) == "not_comparable"
+
+
+@pytest.mark.parametrize("missing", ["subject", "property"])
+def test_semantic_comparability_requires_subject_and_property(missing):
+    left = _semantic_fact()
+    right = _semantic_fact(evidence_id="E002", document_id="prd")
+    left[missing] = None
+    assert _compare_semantic_facts(left, right) == "insufficient_context"
+
+
+def test_semantic_comparability_does_not_accept_unsupported_units():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            unit="furlong",
+        )
+    ) == "insufficient_context"
+
+
+def test_semantic_comparability_accepts_safe_unit_conversion():
+    evidence = [
+        _quantity_evidence(
+            "mrd",
+            "E001",
+            "The measured transmission distance was 10 km under the outdoor test configuration and baseline schedule.",
+        ),
+        _quantity_evidence(
+            "prd",
+            "E002",
+            "The measured transmission distance was 10000 m under the outdoor test configuration and baseline schedule.",
+        ),
+    ]
+    facts = _normalized_quantity_facts(evidence)
+
+    assert [fact["value"] for fact in facts] == [10_000.0, 10_000.0]
+    assert [fact["unit"] for fact in facts] == ["m", "m"]
+    assert _semantic_fact_comparability(*facts)[0] == "equivalent"
+
+
+def test_semantic_comparability_requires_traceable_location():
+    assert _compare_semantic_facts(
+        right=_semantic_fact(
+            evidence_id="E002",
+            document_id="prd",
+            location=None,
+        )
+    ) == "insufficient_context"
+
+
+def test_normalized_fact_exposes_semantic_attributes_and_traceability():
+    evidence = [_quantity_evidence(
+        "mrd",
+        "E001",
+        "The planned prototype project duration is 18 months under the baseline schedule.",
+    )]
+
+    fact = _normalized_quantity_facts(evidence)[0]
+
+    assert fact["entity"] == "project_prototype"
+    assert fact["attribute_type"] == "duration"
+    assert fact["measurement_state"] == "planned"
+    assert fact["evidence_refs"] == ["E001"]
+    assert fact["source_location"] == "paragraph 1"
+
+
+def test_actual_or_verified_state_is_not_inferred_from_an_estimate():
+    evidence = [_quantity_evidence(
+        "ttr",
+        "E001",
+        "The estimated cost reduction is 40% pending BOM and TCO validation.",
+    )]
+
+    fact = _normalized_quantity_facts(evidence)[0]
+
+    assert fact["measurement_state"] == "estimate"
+    assert fact["measurement_state"] not in {"verified", "actual"}
+
+
+def test_case_a_equal_planned_delivery_is_reclassified_consistent(tmp_path):
+    manifest = create_manifest(
+        tmp_path,
+        "M1 - Nghiệm thu V1 | T0 + 18 tháng | Có mẫu và hồ sơ kỹ thuật để demo.",
+        "Thời gian có mẫu: 18 tháng (mẫu + hồ sơ).",
+    )
+    finding = model_finding()
+    finding["claim"] = "Both documents specify the same planned prototype delivery window."
+
+    report = review_pair(
+        manifest,
+        "mrd",
+        "prd",
+        "Compare the 18-month project delivery scope in the MRD and PRD. Do they describe the same planned task period?",
+        MockClient(response([finding])),
+    )
+
+    assert report["final_classification"] == "consistent"
+    assert report["findings"][0]["status"] == "consistent"
+    assert report["findings"][0]["source_model_status"] == "contradiction_candidate"
+    assert report["rejected_findings"] == []
+    assert report["evidence_gaps"] == []
+    assert {item["document_id"] for item in report["findings"][0]["evidence"]} == {
+        "mrd", "prd",
+    }
+    assert all(item["location"] for item in report["findings"][0]["evidence"])
+
+
+def test_case_a_recovers_cross_document_support_when_model_cites_one_document():
+    evidence = [
+        _quantity_evidence(
+            "mrd",
+            "E001",
+            "M1 - Nghiệm thu V1 at T0 + 18 months, with a prototype sample and technical report for demonstration.",
+        ),
+        _quantity_evidence(
+            "prd",
+            "E002",
+            "Thời gian có mẫu: 18 tháng (mẫu + hồ sơ).",
+        ),
+        _quantity_evidence(
+            "prd",
+            "E003",
+            "The product warranty duration is 18 months after acceptance.",
+        ),
+    ]
+    finding = model_finding(
+        refs=["E002", "E003"],
+        comparison_basis={
+            "subject": "prototype",
+            "quantity": "duration",
+            "unit": "months",
+            "timeframe": "planned",
+            "conditions": "same",
+        },
+    )
+    parsed = json.loads(response([finding]))
+    accepted, rejected, _ = _validate_findings(
+        parsed, evidence
+    )
+    accepted, rejected, classification, _ = _apply_classification_policy(
+        "Compare the 18-month project delivery duration.",
+        parsed,
+        evidence,
+        accepted,
+        rejected,
+    )
+
+    assert classification == "consistent"
+    assert len(accepted) == 1
+    assert accepted[0]["status"] == "consistent"
+    assert accepted[0]["source_model_evidence_refs"] == ["E002", "E003"]
+    assert accepted[0]["evidence_refs"] == ["E001", "E002"]
+    assert [item["document_id"] for item in accepted[0]["evidence"]] == [
+        "mrd", "prd",
+    ]
+    assert rejected == []
+
+
+def test_case_b_estimate_is_classified_mentioned_unverified(tmp_path):
+    manifest = create_manifest(
+        tmp_path,
+        "The estimated cost reduction is 40%, pending BOM, quotations and TCO validation.",
+        "The approximately 40% cost reduction is an assumption until BOM, quotations and TCO are available.",
+    )
+    finding = model_finding(
+        status="unsupported",
+        finding_type="unsupported_claim",
+        refs=["E001", "E002"],
+        comparison_basis=None,
+    )
+    finding["claim"] = "The 40% cost reduction is an unverified estimate."
+
+    report = review_pair(
+        manifest,
+        "mrd",
+        "prd",
+        "Does the available evidence verify the approximately 40% cost-reduction estimate, or is it still an assumption pending BOM, quotations and TCO?",
+        MockClient(response([finding])),
+    )
+
+    assert report["final_classification"] == "mentioned_unverified"
+    assert report["findings"][0]["status"] == "mentioned_unverified"
+    assert report["findings"][0]["source_model_status"] == "unsupported"
+    assert report["rejected_findings"] == []
+    assert report["evidence_gaps"] == []
+    assert {item["document_id"] for item in report["findings"][0]["evidence"]} == {
+        "mrd", "prd",
+    }
+
+
+def test_case_c_frequency_and_distance_are_not_comparable(tmp_path):
+    manifest = create_manifest(
+        tmp_path,
+        "Channel bandwidth is 100 MHz; propagation distance is 100 m in the outdoor test.",
+        "The channel uses 100 MHz and the outdoor test scenario uses 100 m.",
+    )
+    finding = model_finding()
+    finding["claim"] = "100 MHz bandwidth contradicts a 100 m transmission distance."
+
+    report = review_pair(
+        manifest,
+        "mrd",
+        "prd",
+        "Do 100 MHz bandwidth and 100 m propagation distance establish a contradiction?",
+        MockClient(response([finding])),
+    )
+
+    assert report["final_classification"] == "not_comparable"
+    assert report["findings"] == []
+    assert report["rejected_findings"][0]["classification"] == "not_comparable"
+    assert report["evidence_gaps"] == []
+    assert any(
+        item["decision"] == "not_comparable"
+        and item["left"]["dimension"] != item["right"]["dimension"]
+        for item in report["comparability_decisions"]
+    )
+
+
+def test_normalized_bandwidth_and_distance_are_different_dimensions():
+    evidence = [
+        _quantity_evidence(
+            "prd", "E001",
+            "The channel bandwidth is 100 MHz for the outdoor test configuration.",
+        ),
+        _quantity_evidence(
+            "ttr", "E002",
+            "The propagation distance is 100 m for the outdoor test configuration.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+
+    assert [(fact["dimension"], fact["property"]) for fact in facts] == [
+        ("frequency", "channel_bandwidth"),
+        ("length", "transmission_distance"),
+    ]
+    assert facts[0]["source_location"] == "paragraph 1"
+
+
+def test_same_dimension_does_not_make_different_properties_comparable():
+    evidence = [
+        _quantity_evidence(
+            "prd", "E001",
+            "Channel bandwidth is 100 MHz in the n78 test configuration.",
+        ),
+        _quantity_evidence(
+            "ttr", "E002",
+            "Carrier frequency is 200 MHz in the n78 test configuration.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+    pairs, reasons = _quantity_pairs(
+        evidence, require_complete_context=True
+    )
+
+    assert [fact["dimension"] for fact in facts] == ["frequency", "frequency"]
+    assert [fact["property"] for fact in facts] == [
+        "channel_bandwidth",
+        "carrier_frequency",
+    ]
+    assert pairs == []
+    assert any("same measured property" in reason for reason in reasons)
+
+
+def test_same_planned_project_duration_can_be_consistent_deterministically():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The planned prototype project duration is 18 months under the baseline schedule with the accepted scope.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The planned prototype project duration is 18 months under the baseline schedule with the accepted scope.",
+        ),
+    ]
+    finding = model_finding(
+        status="consistent",
+        finding_type="direct_contradiction",
+        comparison_basis={
+            "subject": "planned prototype",
+            "quantity": "duration",
+            "unit": "months",
+            "timeframe": "baseline schedule",
+            "conditions": "accepted scope",
+        },
+    )
+
+    accepted, rejected, _ = _validate_direct_finding(finding, evidence)
+
+    assert [item["status"] for item in accepted] == ["consistent"]
+    assert rejected == []
+    fact = _normalized_quantity_facts(evidence)[0]
+    assert fact["subject"] == "project_prototype"
+    assert fact["property"] == "project_duration"
+    assert fact["scope"] == "planned"
+
+
+def test_project_duration_and_warranty_duration_are_distinct_properties():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The project duration is planned for 18 months.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The product warranty duration is 18 months after acceptance.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+
+    assert facts[0]["property"] == "project_duration"
+    assert facts[1]["property"] == "warranty_duration"
+    assert facts[0]["property"] != facts[1]["property"]
+
+
+def test_estimated_cost_reduction_is_not_measured_cost_reduction():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The estimated cost reduction is 40% pending BOM and TCO.",
+        ),
+        _quantity_evidence(
+            "ttr", "E002",
+            "The measured cost reduction was 40% after the approved test.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+
+    assert [fact["property"] for fact in facts] == [
+        "cost_reduction",
+        "cost_reduction",
+    ]
+    assert [fact["scope"] for fact in facts] == [
+        "estimate",
+        "measured_actual",
+    ]
+    assert _quantity_pairs(evidence, require_complete_context=False)[0] == []
+
+
+def test_length_units_convert_exactly_before_comparison():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The measured transmission distance was 10 km under the outdoor test configuration.",
+        ),
+        _quantity_evidence(
+            "ttr", "E002",
+            "The measured transmission distance was 10000 m under the outdoor test configuration.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+    pairs, _ = _quantity_pairs(evidence, require_complete_context=False)
+
+    assert facts[0]["dimension"] == facts[1]["dimension"] == "length"
+    assert facts[0]["unit"] == facts[1]["unit"] == "m"
+    assert facts[0]["value"] == facts[1]["value"] == 10_000
+    assert len(pairs) == 1
+
+
+def test_different_time_contexts_are_not_a_contradiction():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The planned project duration is 18 months in 2025 under the baseline schedule with accepted scope.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The planned project duration is 12 months in 2026 under the baseline schedule with accepted scope.",
+        ),
+    ]
+
+    facts = _normalized_quantity_facts(evidence)
+    pairs, reasons = _quantity_pairs(evidence, require_complete_context=True)
+
+    assert [fact["time_context"] for fact in facts] == ["2025", "2026"]
+    assert pairs == []
+    assert any("time contexts" in reason for reason in reasons)
+
+
+def test_missing_source_location_rejects_contradiction_without_inventing_one():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The planned prototype project duration is 18 months under the baseline schedule with the accepted scope.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The planned prototype project duration is 12 months under the baseline schedule with the accepted scope.",
+            location=None,
+        ),
+    ]
+    finding = model_finding()
+
+    accepted, rejected, _ = _validate_direct_finding(finding, evidence)
+
+    assert accepted == []
+    assert "location is unavailable" in rejected[0]["reason"]
+    assert all(fact["source_location"] is None for fact in _normalized_quantity_facts(evidence) if fact["source_document_id"] == "prd")
+
+
+def test_unknown_evidence_reference_is_rejected():
+    evidence = [
+        _quantity_evidence("mrd", "E001", "The project duration is 18 months."),
+        _quantity_evidence("prd", "E002", "The project duration is 12 months."),
+    ]
+    finding = model_finding(refs=["E001", "E999"])
+
+    accepted, rejected, _ = _validate_direct_finding(finding, evidence)
+
+    assert accepted == []
+    assert "not present in the input" in rejected[0]["reason"]
+
+
+def test_unsupported_comparison_basis_is_rejected():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The planned prototype project duration is 18 months under the baseline schedule with the accepted scope.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The planned prototype project duration is 12 months under the baseline schedule with the accepted scope.",
+        ),
+    ]
+    finding = model_finding(comparison_basis={
+        "subject": "invented target",
+        "quantity": "duration",
+        "unit": "months",
+        "timeframe": "baseline schedule",
+        "conditions": "accepted scope",
+    })
+
+    accepted, rejected, _ = _validate_direct_finding(finding, evidence)
+
+    assert accepted == []
+    assert "source-supported matching" in rejected[0]["reason"]
+
+
+def test_unsupported_dimension_cannot_be_accepted_as_contradiction():
+    evidence = [
+        _quantity_evidence(
+            "mrd", "E001",
+            "The planned prototype project uses 10 furlongs under the baseline schedule with the accepted scope.",
+        ),
+        _quantity_evidence(
+            "prd", "E002",
+            "The planned prototype project uses 12 furlongs under the baseline schedule with the accepted scope.",
+        ),
+    ]
+    finding = model_finding(comparison_basis={
+        "subject": "prototype project",
+        "quantity": "furlongs",
+        "unit": "furlongs",
+        "timeframe": "baseline schedule",
+        "conditions": "accepted scope",
+    })
+
+    accepted, rejected, _ = _validate_direct_finding(finding, evidence)
+
+    assert accepted == []
+    assert "No source-supported numeric facts" in rejected[0]["reason"]
+
+
+def test_legacy_consistent_review_still_returns_traceable_finding(tmp_path):
+    manifest = create_manifest(
+        tmp_path,
+        "The JEV prototype target is 18 months.",
+        "The JEV prototype target is 18 months.",
+    )
+    finding = model_finding(
+        status="consistent",
+        finding_type="direct_contradiction",
+        comparison_basis={
+            "subject": "JEV prototype",
+            "quantity": "18 months",
+            "unit": "months",
+            "timeframe": "18 months",
+            "conditions": "target",
+        },
+    )
+    finding["claim"] = "The prototype target is consistent."
+
+    report = review_pair(
+        manifest, "mrd", "prd",
+        "Compare the JEV prototype target duration.",
+        MockClient(response([finding])),
+    )
+
+    assert report["status"] == "completed"
+    assert report["outcome"] == "findings"
+    assert report["findings"][0]["status"] == "consistent"
+    assert all(item["location"] for item in report["findings"][0]["evidence"])
 
 
 def test_local_completion_adapter_checks_finish_reason_and_json_request(monkeypatch):
